@@ -1,0 +1,21 @@
+# Environment & secrets
+.env
+*.db
+fyers_tokens.db
+
+# Python artifacts
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+
+# Logs
+*.log
+paper_trade_log.csv
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+
