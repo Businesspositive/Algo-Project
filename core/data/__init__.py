@@ -1,11 +1,19 @@
-"""
-Data access layer: concrete sources implement the DataSource interface.
-"""
-
 from .base import DataSource
-from .fyers import FyersDataSource
-from .yfinance import YFinanceDataSource
 
-__all__ = ["DataSource", "FyersDataSource", "YFinanceDataSource"]
+__all__ = [
+    "DataSource",
+    "FyersDataSource",
+    "YFinanceDataSource",
+]
 
 
+def __getattr__(name):
+    if name == "FyersDataSource":
+        from .fyers import FyersDataSource
+        return FyersDataSource
+
+    if name == "YFinanceDataSource":
+        from .yfinance import YFinanceDataSource
+        return YFinanceDataSource
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

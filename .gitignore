@@ -1,21 +1,51 @@
-# Environment & secrets
+# Environment and secrets
 .env
-*.db
-fyers_tokens.db
+.env.*
+!.env.example
+config/.env
+*.pem
+*.key
 
-# Python artifacts
+# Python
 __pycache__/
-*.pyc
-.mypy_cache/
-.pytest_cache/
-
-# Logs
-*.log
-paper_trade_log.csv
+*.py[cod]
+*.pyo
 
 # Virtual environments
 env/
 venv/
 .venv/
 
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
+# Code quality
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+logs/
+paper_trade_log.csv
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+fyers_tokens.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
