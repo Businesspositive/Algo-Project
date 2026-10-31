@@ -1,33 +1,89 @@
 # Project Setup
 
-## 1. Python Environment
+## 1. Prerequisites
+
+- Python 3.10 or later
+- pip
+- Git
+
+## 2. Create a virtual environment
+
+Linux/macOS:
 
 ```bash
-python3 -m venv env
-source env/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Windows:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+## 3. Install dependencies
+
+For application execution:
+
+```bash
 pip install -r requirements.txt
 ```
 
-## 2. Environment Variables
+For development and testing:
 
-1. Copy `config/env.example` to `.env` in the repo root.
-2. Fill in:
-   - `client_id` / `client_secret`: from Fyers app dashboard.
-   - `FYERS_REDIRECT_URI`: must match the redirect configured in the app.
-   - `FYERS_AUTH_CODE`: optional; only needed once to seed the local token database.
-3. Keep `.env` private (already ignored via `.gitignore`).
+```bash
+pip install -r requirements-dev.txt
+```
 
-## 3. Token Initialization
+## 4. Configure Fyers credentials
 
-Run `python main_regime_scan.py` (or any script that triggers `FyersDataSource`) once after setting the `.env`. The first run will exchange `FYERS_AUTH_CODE`, store tokens in `utils/fyers_tokens.db`, and subsequent runs will auto-refresh.
+Copy the example configuration:
 
-If the auth code expires before first use, obtain a fresh code from the Fyers login flow and update `.env`.
+```bash
+cp config/env.example .env
+```
 
-## 4. Running Components
+Configure the following values when using Fyers:
 
-- Regime scan: `python main_regime_scan.py`
-- Paper orchestrator demo: `python orchestrator.py`
+- `client_id`
+- `client_secret`
+- `FYERS_REDIRECT_URI`
+- `FYERS_AUTH_CODE` when generating the initial token
+- `FYERS_PIN` when required for token refresh
 
-Both reuse the same data sources, regime detector, and strategy registry, so new strategies become available everywhere automatically.
+Never commit `.env` or real authentication credentials.
 
+## 5. Running the application
 
+### Market screening
+
+```bash
+python main_regime_scan.py
+```
+
+This workflow currently uses Fyers market data and requires valid authentication.
+
+### Paper trading
+
+```bash
+python orchestrator.py
+```
+
+The orchestrator currently uses its configured default data provider and simulated broker.
+
+## 6. Running tests
+
+```bash
+pytest -q
+```
+
+Tests should use local fixtures and simulated components. They must not require live broker credentials or submit actual orders.
+
+## 7. Important notes
+
+- The paper broker is a simulator.
+- BinanceTestnetBroker is a separate testnet integration.
+- FyersDataSource requires Fyers authentication.
+- External market-data providers may require internet access.
+- Never use production broker credentials in automated tests.

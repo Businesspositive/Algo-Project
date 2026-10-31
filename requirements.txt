@@ -7,3 +7,5 @@ python-dotenv>=1.0.0
 fyers-apiv3
 requests>=2.31.0
 SQLAlchemy>=2.0.0
+Flask>=3.0.0
+backtesting>=0.3.3

@@ -48,7 +48,7 @@ def generate_access_token(auth_code: Optional[str] = None) -> str:
     session.set_token(code)
     resp = session.generate_token()
     if resp.get("s") != "ok":
-        raise RuntimeError(f"Failed to generate FYERS token: {resp}")
+        raise RuntimeError("Failed to generate Fyers access token. Check authentication details.")
     access_token = resp["access_token"]
     refresh_token = resp.get("refresh_token")
     if refresh_token:
@@ -56,7 +56,7 @@ def generate_access_token(auth_code: Optional[str] = None) -> str:
     return access_token
 
 
-def refresh_access_token(pin: Optional[str] = "5526") -> str:
+def refresh_access_token(pin: Optional[str] = None) -> str:
     """
     Refresh access token using the latest stored refresh token.
     """
@@ -76,11 +76,8 @@ def refresh_access_token(pin: Optional[str] = "5526") -> str:
         "appIdHash": app_id_hash,
         "refresh_token": refresh_token,
     }
-    print(pin, "pin")
     if pin:
         payload["pin"] = pin
-    
-    print(payload, "payload")
 
     resp = requests.post(
         "https://api-t1.fyers.in/api/v3/validate-refresh-token",
@@ -88,20 +85,27 @@ def refresh_access_token(pin: Optional[str] = "5526") -> str:
         headers={"Content-Type": "application/json"},
         timeout=10,
     )
-    print(resp.text)
+
+    resp.raise_for_status()
+    body = resp.json()
+
+    if body.get("s") != "ok" or "access_token" not in body:
+        raise RuntimeError("Fyers token refresh failed. Check credentials and API configuration.")
     resp.raise_for_status()
     body = resp.json()
     if body.get("s") != "ok" or "access_token" not in body:
-        raise RuntimeError(f"Refresh token call failed: {body}")
+        raise RuntimeError(f"Refresh token call failed")
     new_access_token = body["access_token"]
     save_tokens(new_access_token, refresh_token)
     return new_access_token
 
 
-def get_fyers_client(pin: str = "5526") -> fyersModel.FyersModel:
+def get_fyers_client(pin: Optional[str] = None) -> fyersModel.FyersModel:
     """
     Ensure we have a valid authenticated Fyers client.
     """
+
+    pin = pin or os.getenv("FYERS_PIN")
     client_id = os.getenv("client_id")
     if not client_id:
         raise ValueError("client_id env variable is required to instantiate FyersModel.")
