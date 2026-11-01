@@ -21,7 +21,7 @@ class MomentumStrategy(Strategy):
         out = df.copy()
         out["ROC"] = out["Close"].pct_change(self.roc_period)
         ema_series = _ema(out["Close"], self.ema_period)
-        ema_series = ema_series.reindex(out.index).fillna(method="bfill")
+        ema_series = ema_series.reindex(out.index).bfill()
         out["EMA"] = ema_series
         out["signal"] = 0
         cond = (out["ROC"] > self.roc_thresh) & (out["Close"] > out["EMA"])
@@ -29,5 +29,4 @@ class MomentumStrategy(Strategy):
         out["signal"] = out["signal"].astype(int)
         out["score"] = out["ROC"]
         return out
-
 

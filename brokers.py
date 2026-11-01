@@ -44,35 +44,122 @@ class FyersPaperBroker(BrokerInterface):
     Simulated paper broker for Indian equities.
     - market_price_provider(symbol) -> float should be provided (callable).
     - fees_pct: percent as 0.05 for 0.05% per executed side (you can include brokerage + taxes).
+    - allow_fractional: Indian cash equities trade in whole shares, so fractional
+      quantities are rejected by default.
+
+    Every order attempt is validated the way a real broker would validate it and
+    either fills or comes back as {"status": "rejected", "reason": <code>, ...}.
+    The broker never raises for a bad order; rejection reasons are:
+        invalid-side, invalid-qty, fractional-qty, invalid-symbol,
+        unsupported-order-type, no-price, limit-not-marketable,
+        insufficient-cash, insufficient-qty
     """
+
+    SUPPORTED_ORDER_TYPES = ("market", "limit")
 
     def __init__(self,
                  initial_cash: float = 100000.0,
                  market_price_provider: Optional[Callable[[str], float]] = None,
-                 fees_pct: float = 0.05):
+                 fees_pct: float = 0.05,
+                 allow_fractional: bool = False):
         self.cash = float(initial_cash)
         self.positions: Dict[str, Dict[str, Any]] = {}  # symbol -> {"qty": int, "avg_price": float}
-        self.trade_log: list[Dict[str, Any]] = []
+        self.trade_log: list[Dict[str, Any]] = []        # executed fills only
+        self.rejections: list[Dict[str, Any]] = []       # audit trail of rejected attempts
         self.fees_pct = float(fees_pct)  # percent e.g., 0.05 = 0.05%
+        self.allow_fractional = bool(allow_fractional)
         self._price_provider = market_price_provider or default_price_provider
 
+    # ---- helpers -------------------------------------------------------
+    def _reject(self, reason: str, symbol: str, side: str, qty: Any, **extra: Any) -> Dict[str, Any]:
+        res = {"status": "rejected", "reason": reason, "symbol": symbol, "side": side, "qty": qty, **extra}
+        self.rejections.append({**res, "time": time.time()})
+        return res
+
+    def _market_price(self, symbol: str) -> tuple[Optional[float], Optional[str]]:
+        """Return (price, error). Provider failures are reported, never raised."""
+        try:
+            px = self._price_provider(symbol)
+        except Exception as exc:
+            return None, f"price-provider-error: {exc!r}"
+        try:
+            px = float(px) if px is not None else None
+        except (TypeError, ValueError):
+            return None, f"non-numeric price {px!r}"
+        if px is None or math.isnan(px) or math.isinf(px) or px <= 0:
+            return None, f"invalid price {px!r}"
+        return px, None
+
+    def _fee(self, price: float, qty: float) -> float:
+        # fees = fees_pct (percent) of notional per side
+        return (self.fees_pct / 100.0) * (price * qty)
+
+    # ---- order entry ---------------------------------------------------
     def place_order(self, symbol: str, side: str, qty: float,
                     order_type: str = "market", price: Optional[float] = None) -> Dict[str, Any]:
-        side = side.upper()
-        assert side in ("BUY", "SELL"), "side must be BUY or SELL"
-        # Determine fill price
-        fill_price = price if price is not None else self._price_provider(symbol)
-        if fill_price is None or math.isnan(fill_price):
-            return {"status": "rejected", "reason": "no-price", "symbol": symbol}
+        side_in = side
+        side = str(side).upper().strip() if side is not None else ""
+        if side not in ("BUY", "SELL"):
+            return self._reject("invalid-side", symbol, side_in, qty, detail="side must be BUY or SELL")
 
-        qty = float(qty)
-        # compute fees = fees_pct (percent) of notional per side
-        fee = (self.fees_pct / 100.0) * (fill_price * qty)
+        if not isinstance(symbol, str) or not symbol.strip():
+            return self._reject("invalid-symbol", symbol, side, qty, detail="symbol must be a non-empty string")
+
+        # quantity validation
+        try:
+            q = float(qty)
+        except (TypeError, ValueError):
+            return self._reject("invalid-qty", symbol, side, qty, detail="qty must be numeric")
+        if math.isnan(q) or math.isinf(q) or q <= 0:
+            return self._reject("invalid-qty", symbol, side, qty, detail="qty must be a positive finite number")
+        if not self.allow_fractional and abs(q - round(q)) > 1e-9:
+            return self._reject("fractional-qty", symbol, side, qty, detail="whole-share quantities only")
+        qty = q
+
+        order_type = str(order_type).lower().strip()
+        if order_type not in self.SUPPORTED_ORDER_TYPES:
+            return self._reject("unsupported-order-type", symbol, side, qty,
+                                detail=f"supported: {self.SUPPORTED_ORDER_TYPES}")
+
+        # Determine fill price
+        if order_type == "market":
+            if price is not None:
+                # explicit fill-price override (handy for deterministic simulations)
+                try:
+                    fill_price = float(price)
+                except (TypeError, ValueError):
+                    return self._reject("no-price", symbol, side, qty, detail=f"non-numeric price {price!r}")
+                if math.isnan(fill_price) or math.isinf(fill_price) or fill_price <= 0:
+                    return self._reject("no-price", symbol, side, qty, detail=f"invalid price {price!r}")
+            else:
+                fill_price, err = self._market_price(symbol)
+                if fill_price is None:
+                    return self._reject("no-price", symbol, side, qty, detail=err)
+        else:  # limit
+            try:
+                limit_price = float(price) if price is not None else None
+            except (TypeError, ValueError):
+                limit_price = None
+            if limit_price is None or math.isnan(limit_price) or limit_price <= 0:
+                return self._reject("no-price", symbol, side, qty, detail="limit orders require a positive price")
+            market, err = self._market_price(symbol)
+            if market is None:
+                return self._reject("no-price", symbol, side, qty, detail=err)
+            # no resting order book in the simulator: a limit order either
+            # crosses the current market and fills at market, or is rejected.
+            marketable = market <= limit_price if side == "BUY" else market >= limit_price
+            if not marketable:
+                return self._reject("limit-not-marketable", symbol, side, qty,
+                                    limit_price=limit_price, market_price=market)
+            fill_price = market
+
+        fee = self._fee(fill_price, qty)
 
         if side == "BUY":
             total_cost = fill_price * qty + fee
             if total_cost > self.cash + 1e-9:
-                return {"status": "rejected", "reason": "insufficient-cash", "required": total_cost, "available": self.cash}
+                return self._reject("insufficient-cash", symbol, side, qty,
+                                    required=total_cost, available=self.cash, price=fill_price)
             # update position
             pos = self.positions.get(symbol)
             if pos:
@@ -89,13 +176,13 @@ class FyersPaperBroker(BrokerInterface):
 
         else:  # SELL
             pos = self.positions.get(symbol)
+            available = pos["qty"] if pos else 0
             if not pos or pos["qty"] < qty - 1e-9:
-                return {"status": "rejected", "reason": "insufficient-qty", "available_qty": pos["qty"] if pos else 0}
+                return self._reject("insufficient-qty", symbol, side, qty, available_qty=available)
             proceed = fill_price * qty
-            fee = (self.fees_pct / 100.0) * (fill_price * qty)
             self.cash += proceed - fee
             pos["qty"] -= qty
-            if pos["qty"] <= 0:
+            if pos["qty"] <= 1e-9:
                 del self.positions[symbol]
             record = {"symbol": symbol, "side": side, "qty": qty, "price": fill_price, "fee": fee, "time": time.time()}
             self.trade_log.append(record)
@@ -155,8 +242,9 @@ class BinanceTestnetBroker(BrokerInterface):
 
     def place_order(self, symbol: str, side: str, qty: float,
                     order_type: str = "market", price: Optional[float] = None) -> Dict[str, Any]:
-        side = side.upper()
-        assert side in ("BUY", "SELL")
+        side = str(side).upper().strip()
+        if side not in ("BUY", "SELL"):
+            return {"status": "rejected", "reason": "invalid-side", "symbol": symbol, "side": side, "qty": qty}
         try:
             # MARKET order
             if order_type.lower() == "market":
