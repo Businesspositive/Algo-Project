@@ -26,3 +26,16 @@ def sample_ohlcv():
         },
         index=dates,
     )
+
+@pytest.fixture(autouse=True)
+def isolated_market_data_cache(tmp_path, monkeypatch):
+    """
+    Point the on-disk market-data cache (core/data/base.py) at a per-test
+    directory. Providers that opt in with ``cache = DEFAULT_CACHE`` resolve the
+    location at call time, so this keeps tests from reading or writing the
+    developer's real cache -- or each other's -- while still exercising the
+    real cache code path.
+    """
+    cache_dir = tmp_path / "market_data_cache"
+    monkeypatch.setenv("MARKET_DATA_CACHE_DIR", str(cache_dir))
+    return cache_dir

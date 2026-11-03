@@ -17,7 +17,7 @@ class StaticDataSource(DataSource):
     def __init__(self, df: pd.DataFrame):
         self.df = df
 
-    def fetch(self, symbol, start, end=None, interval="1d"):
+    def _fetch_raw(self, symbol, start, end=None, interval="1d"):
         return self.df
 
 

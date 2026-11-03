@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from fyers_apiv3 import fyersModel
 
 from utils.database import save_tokens, get_latest_tokens
-from .base import DataSource
+from .base import DataSource, DEFAULT_CACHE
 
 load_dotenv()
 
@@ -132,10 +132,17 @@ class FyersDataSource(DataSource):
     Automatically chunks requests to comply with API limits.
     """
 
+    #: Fyers stamps daily candles at 00:00 IST (18:30 UTC the previous day),
+    #: so trading-day detection must look at the weekday in IST.
+    calendar_tz = "Asia/Kolkata"
+
+    #: Remote API: cache standardised bars locally to stay clear of rate limits.
+    cache = DEFAULT_CACHE
+
     def __init__(self, fyers_client: Optional[fyersModel.FyersModel] = None):
         self._client = fyers_client or get_fyers_client()
 
-    def fetch(
+    def _fetch_raw(
         self,
         symbol: str,
         start: str,
@@ -158,22 +165,33 @@ class FyersDataSource(DataSource):
                 "range_to": current_end.strftime("%Y-%m-%d"),
                 "cont_flag": "1",
             }
-            response = self._client.history(payload)
-            candles = response.get("candles", [])
-            if not candles:
-                break
-            df = pd.DataFrame(
-                candles,
-                columns=["timestamp", "Open", "High", "Low", "Close", "Volume"],
-            )
-            df["Date"] = pd.to_datetime(df["timestamp"], unit="s")
-            df.set_index("Date", inplace=True)
-            df.drop(columns=["timestamp"], inplace=True)
-            frames.append(df)
+            response = self._client.history(payload) or {}
+            # Fyers answers {"s": "ok"|"no_data", "candles": [...]} on success and
+            # {"s": "error", "code": ..., "message": ...} on failure (including
+            # 429 rate limits). An error must surface, never masquerade as "no
+            # data": an empty result can legitimately extend the cache's
+            # coverage, which would turn a transient failure into a permanent hole.
+            status = response.get("s", "ok" if "candles" in response else "error")
+            if status not in ("ok", "no_data"):
+                raise RuntimeError(
+                    f"Fyers history request failed for {payload['symbol']} "
+                    f"{payload['range_from']}..{payload['range_to']}: "
+                    f"{response.get('message') or response}"
+                )
+            candles = response.get("candles") or []
+            if candles:  # an empty chunk (e.g. a suspended year) must not end the loop
+                df = pd.DataFrame(
+                    candles,
+                    columns=["timestamp", "Open", "High", "Low", "Close", "Volume"],
+                )
+                df["Date"] = pd.to_datetime(df["timestamp"], unit="s")
+                df.set_index("Date", inplace=True)
+                df.drop(columns=["timestamp"], inplace=True)
+                frames.append(df)
             current_start = current_end + timedelta(days=1)
 
         if not frames:
-            return pd.DataFrame()
+            return self.empty_frame()
         data = pd.concat(frames).sort_index()
         data = data[["Open", "High", "Low", "Close", "Volume"]].dropna()
         return data
@@ -185,5 +203,4 @@ class FyersDataSource(DataSource):
         if ticker.endswith(".NS"):
             return f"NSE:{ticker.replace('.NS', '')}-EQ"
         return ticker
-
 
