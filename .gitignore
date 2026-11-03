@@ -49,3 +49,6 @@ dist/
 # Operating system
 .DS_Store
 Thumbs.db
+
+# Local market-data cache (core/data/base.py)
+.cache/
