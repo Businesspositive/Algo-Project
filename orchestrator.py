@@ -7,31 +7,11 @@ from typing import Dict, Any
 from datetime import datetime, timedelta
 from core.data import DataSource, YFinanceDataSource
 from core.strategies.base import Strategy
-from core.strategies.registry import get_strategy_class
+from core.strategies.registry import REGIME_STRATEGY_MAP, get_strategy_class
+from core.strategies.router import RoutingDecision, StrategyRouter
 from regimes.detector import RegimeDetector
+from regimes.stability import DEFAULT_MIN_STABLE_PERIODS, RegimeCooldown, RegimeStability
 from brokers import FyersPaperBroker, BinanceTestnetBroker, default_price_provider
-
-# For demo I'll create minimal placeholders if you need to swap
-# NOTE: replace these placeholders with your actual classes
-# class BreakoutStrategy:
-#     def __init__(self, lookback_high=20, lookback_low=10):
-#         self.name = "Breakout"
-#         self.lb_h = lookback_high
-#         self.lb_l = lookback_low
-#     def generate_signals(self, df):
-#         out = df.copy()
-#         out['DC_H'] = out['High'].rolling(self.lb_h).max().shift(1)
-#         out['signal'] = (out['Close'] > out['DC_H']).astype(int)
-#         return out
-
-# class RegimeDetector:
-#     def __init__(self, thresholds=None): pass
-#     def latest_regime(self, df):
-#         # crude placeholder: choose TREND if 20-day slope positive
-#         ma = df['Close'].rolling(20).mean()
-#         slope = (ma.iloc[-1] - ma.iloc[-10]) if len(ma)>10 else 0
-#         regime = "TREND" if slope>0 else "RANGE"
-#         return {"regime": regime, "adx":0.0, "bb_width":0.0, "rvol":0.0, "atr_frac":0.0}
 
 # -------------- Config / thresholds -------------
 SHARPE_MIN = 1.2
@@ -45,17 +25,32 @@ MAX_TOTAL_EXPOSURE = 0.25
 # paper broker's 0.05% default so notional + fee always fits in cash.
 ESTIMATED_FEE_PCT = 0.1
 
-REGIME_MAP = {
-    "Donchian_Breakout": {"allowed": ["VOL_BREAKOUT", "TREND", "NORMAL"]},
-    "RSI_MeanReversion": {"allowed": ["RANGE"]},
-    "Momentum": {"allowed": ["TREND", "NORMAL"]},
-}
+# Per-strategy regime gate, derived from the registry's regime -> strategies
+# table so the orchestrator and the StrategyRouter can never disagree about
+# where a strategy is allowed to trade.  Strategies absent from the registry
+# (e.g. ad-hoc/test strategies) have no entry and are therefore unrestricted.
+REGIME_MAP: Dict[str, Dict[str, list]] = {}
+for _regime, _names in REGIME_STRATEGY_MAP.items():
+    for _name in _names:
+        REGIME_MAP.setdefault(_name, {"allowed": []})["allowed"].append(_regime)
+del _regime, _names, _name
 # ------------------------------------------------
 
 # lightweight trade history persistence (CSV)
 TRADE_LOG_CSV = "paper_trade_log.csv"
 TRADE_LOG_COLUMNS = ['timestamp', 'strategy', 'symbol', 'side', 'qty', 'price',
-                     'entry_price', 'fees', 'pnl']
+                     'entry_price', 'fees', 'pnl', 'reason']
+
+# Values written to the trade log's `reason` column.
+REASON_SIGNAL = "signal"                 # the strategy's own signal opened/closed the trade
+REASON_REGIME_CASH = "regime_cash"       # forced: regime routed to cash (unknown / QUIET / detector failure)
+REASON_REGIME_SHIFT = "regime_shift"     # forced: owner no longer eligible in the new regime
+REASON_UNATTRIBUTED = "unattributed"     # forced: open position with no owner in the trade log
+REASON_MANUAL = "manual"                 # forced: explicit flatten_all_positions() call
+
+# Strategy label used when a position has to be closed but the trade log
+# cannot say which strategy opened it (e.g. log lost, or opened out-of-band).
+UNATTRIBUTED_STRATEGY = "Unattributed"
 
 def load_trade_history() -> pd.DataFrame:
     try:
@@ -93,6 +88,31 @@ def find_open_entry(strategy_name: str, symbol: str) -> Dict[str, Any] | None:
     if sold_since + 1e-9 >= float(last_buy['qty']):
         return None  # fully closed (possibly across several partial exits)
     return last_buy.to_dict()
+
+def find_position_owner(symbol: str) -> str | None:
+    """
+    Name of the strategy whose BUY opened the currently open position in
+    `symbol`, or None if the log shows no open round trip for it.
+
+    Regimes (and therefore the routed strategy) change between cycles, but a
+    position must be *closed* by the strategy that opened it so the SELL pairs
+    with the right BUY and realised P&L is attributed to the right strategy.
+    If several strategies somehow hold the symbol at once, the most recently
+    opened one wins.
+    """
+    df = load_trade_history()
+    df = df[df['symbol'] == symbol].dropna(subset=['strategy'])
+    if df.empty:
+        return None
+    owner, owner_ts = None, None
+    for name in df['strategy'].astype(str).unique():
+        entry = find_open_entry(name, symbol)
+        if entry is None:
+            continue
+        ts = pd.Timestamp(entry['timestamp'])
+        if owner_ts is None or ts > owner_ts:
+            owner, owner_ts = name, ts
+    return owner
 
 def compute_realised_pnl(entry_price: float, exit_price: float, qty: float, fees: float = 0.0) -> float:
     """
@@ -262,36 +282,158 @@ def estimated_fee_pct_for(broker) -> float:
     return max(ESTIMATED_FEE_PCT, actual)
 
 
+# ---------- unsettled liquidations ----------
+class PendingLiquidation:
+    """
+    A sell whose proceeds we do not yet trust as spendable and whose shares we
+    do not yet trust as off the book (fill not propagated, T+n settlement...).
+
+    pre_qty  -- holding *before* the sell, so the exposure snapshot can tell
+                which part of the sale the broker already reflects.
+    qty      -- shares sold.
+    price    -- average fill price.
+    proceeds -- net cash expected from the sale (notional minus fees).
+    """
+
+    def __init__(self, symbol: str, qty: float, price: float, proceeds: float,
+                 pre_qty: float, timestamp: pd.Timestamp | None = None, reason: str = ""):
+        self.symbol = symbol
+        self.qty = float(qty)
+        self.price = float(price)
+        self.proceeds = max(0.0, float(proceeds))
+        self.pre_qty = float(pre_qty)
+        self.timestamp = timestamp or pd.Timestamp.now()
+        self.reason = reason
+
+    @property
+    def notional(self) -> float:
+        return self.qty * self.price
+
+    def unreflected_qty(self, shown_qty: float) -> float:
+        """Shares of this sale that `get_positions()` no longer reports (0 if the
+        broker still shows the full pre-sale holding, i.e. it is already counted)."""
+        return max(0.0, min(self.qty, self.pre_qty - float(shown_qty or 0.0)))
+
+    def __repr__(self) -> str:
+        return (f"PendingLiquidation({self.symbol}, qty={self.qty}, price={self.price}, "
+                f"proceeds={self.proceeds:.2f}, reason={self.reason!r})")
+
+
+class SettlementLedger:
+    """
+    Liquidations whose proceeds are still unsettled.
+
+    The orchestrator records every forced flatten here and the risk gates
+    consult it, so freed capital cannot be redeployed -- and the liquidated
+    exposure is not considered gone -- until settlement.  Share one ledger
+    across a sweep of symbols so a flatten in one cycle is respected by the
+    entries of every later cycle in the same run.
+
+    settlement_delay:
+        None  -> entries stay pending until `clear()` / `settle()` is called
+                 (the right default for a ledger that lives for one sweep).
+        timedelta -> entries expire automatically once that much time has
+                 passed since the fill (e.g. timedelta(days=1) for T+1).
+    """
+
+    def __init__(self, settlement_delay: timedelta | None = None):
+        self.settlement_delay = settlement_delay
+        self._items: list[PendingLiquidation] = []
+
+    def record(self, liq: PendingLiquidation | None) -> None:
+        if liq is not None and liq.qty > 0:
+            self._items.append(liq)
+
+    def pending(self, now: pd.Timestamp | None = None) -> list[PendingLiquidation]:
+        if self.settlement_delay is None:
+            return list(self._items)
+        now = now or pd.Timestamp.now()
+        self._items = [x for x in self._items if x.timestamp + self.settlement_delay > now]
+        return list(self._items)
+
+    def settle(self, symbol: str | None = None) -> None:
+        """Mark everything (or one symbol) as settled."""
+        self._items = [] if symbol is None else [x for x in self._items if x.symbol != symbol]
+
+    clear = settle
+
+    @property
+    def unsettled_proceeds(self) -> float:
+        return sum(x.proceeds for x in self.pending())
+
+    def __len__(self) -> int:
+        return len(self.pending())
+
+    def __repr__(self) -> str:
+        return f"SettlementLedger(pending={self.pending()!r})"
+
+
+def _pending_list(pending) -> list[PendingLiquidation]:
+    if pending is None:
+        return []
+    if isinstance(pending, SettlementLedger):
+        return pending.pending()
+    if isinstance(pending, PendingLiquidation):
+        return [pending]
+    return list(pending)
+
+
 # ---------- portfolio-level risk ----------
-def compute_portfolio_exposure(broker, price_lookup: Dict[str, float] | None = None) -> Dict[str, float]:
+def compute_portfolio_exposure(broker, price_lookup: Dict[str, float] | None = None,
+                               pending=None) -> Dict[str, float]:
     """
     Snapshot of how much of the portfolio is currently deployed across *all*
     open positions, valued at market where a price is available.
 
-    Returns cash, positions_value, portfolio_value and exposure
-    (= positions_value / portfolio_value, 0..1).
+    `pending` (SettlementLedger / PendingLiquidation / iterable of them) adds
+    the strict treatment of unsettled liquidations:
+
+      in_flight_value     -- market value of sold shares the broker no longer
+                             shows but whose sale is not yet settled.  It is
+                             counted as exposure: until settled, that risk is
+                             not considered off the book.
+      unsettled_proceeds  -- cash from those sales we may not spend yet.
+      settled_cash        -- cash minus unsettled_proceeds (floored at 0): the
+                             only cash position sizing may use.
+
+    Returns cash, settled_cash, positions_value, in_flight_value,
+    unsettled_proceeds, portfolio_value and exposure
+    (= (positions_value + in_flight_value) / portfolio_value, 0..1).
+    Without `pending` the extra fields are zero and exposure is the plain
+    positions_value / portfolio_value.
     """
     cash = float(broker.get_balance()['cash'])
     positions = broker.get_positions() or {}
     if not positions:
-        return {"cash": cash, "positions_value": 0.0, "portfolio_value": cash, "exposure": 0.0}
+        positions_value, portfolio_value = 0.0, cash
+    else:
+        try:
+            portfolio_value = float(broker.portfolio_value(price_lookup))
+            positions_value = portfolio_value - cash
+        except Exception as exc:  # a flaky quote must not disable risk checks
+            print(f"portfolio_value() failed ({exc!r}); valuing open positions at cost basis")
+            positions_value = 0.0
+            for sym, pos in positions.items():
+                px = (price_lookup or {}).get(sym) or pos.get('avg_price') or 0.0
+                positions_value += float(pos.get('qty', 0.0)) * float(px)
+            portfolio_value = cash + positions_value
+        positions_value = max(0.0, positions_value)
 
-    try:
-        portfolio_value = float(broker.portfolio_value(price_lookup))
-        positions_value = portfolio_value - cash
-    except Exception as exc:  # a flaky quote must not disable risk checks
-        print(f"portfolio_value() failed ({exc!r}); valuing open positions at cost basis")
-        positions_value = 0.0
-        for sym, pos in positions.items():
-            px = (price_lookup or {}).get(sym) or pos.get('avg_price') or 0.0
-            positions_value += float(pos.get('qty', 0.0)) * float(px)
-        portfolio_value = cash + positions_value
+    in_flight_value, unsettled_proceeds = 0.0, 0.0
+    for liq in _pending_list(pending):
+        shown_qty = float((positions.get(liq.symbol) or {}).get('qty', 0.0) or 0.0)
+        px = (price_lookup or {}).get(liq.symbol) or liq.price
+        in_flight_value += liq.unreflected_qty(shown_qty) * float(px)
+        unsettled_proceeds += liq.proceeds
 
-    positions_value = max(0.0, positions_value)
-    exposure = positions_value / portfolio_value if portfolio_value > 0 else float('inf')
+    deployed = positions_value + in_flight_value
+    exposure = deployed / portfolio_value if portfolio_value > 0 else (float('inf') if deployed > 0 else 0.0)
     return {
         "cash": cash,
+        "settled_cash": max(0.0, cash - unsettled_proceeds),
         "positions_value": positions_value,
+        "in_flight_value": in_flight_value,
+        "unsettled_proceeds": unsettled_proceeds,
         "portfolio_value": portfolio_value,
         "exposure": exposure,
     }
@@ -300,23 +442,25 @@ def compute_portfolio_exposure(broker, price_lookup: Dict[str, float] | None = N
 def check_total_exposure(broker, symbol: str, qty: float, price: float,
                          max_total_exposure: float = MAX_TOTAL_EXPOSURE,
                          price_lookup: Dict[str, float] | None = None,
-                         snapshot: Dict[str, float] | None = None) -> tuple[bool, Dict[str, float]]:
+                         snapshot: Dict[str, float] | None = None,
+                         pending=None) -> tuple[bool, Dict[str, float]]:
     """
     Would adding `qty` of `symbol` at `price` keep total portfolio exposure
     within `max_total_exposure`?  Returns (allowed, details).
 
     Buying converts cash into stock, so the portfolio value is unchanged by
     the trade (fees aside) and the projected exposure is simply
-    (current positions value + new notional) / portfolio value.
+    (open positions + unsettled liquidations + new notional) / portfolio value.
     """
     if snapshot is None:
         lookup = dict(price_lookup or {})
         lookup.setdefault(symbol, price)  # value any existing holding of this symbol at the signal price
-        snapshot = compute_portfolio_exposure(broker, lookup)
+        snapshot = compute_portfolio_exposure(broker, lookup, pending=pending)
     snap = snapshot
     new_notional = float(qty) * float(price)
     pv = snap["portfolio_value"]
-    projected = (snap["positions_value"] + new_notional) / pv if pv > 0 else float('inf')
+    deployed = snap["positions_value"] + snap.get("in_flight_value", 0.0)
+    projected = (deployed + new_notional) / pv if pv > 0 else float('inf')
     allowed = projected <= max_total_exposure + 1e-9
     details = {
         **snap,
@@ -327,14 +471,333 @@ def check_total_exposure(broker, symbol: str, qty: float, price: float,
     return allowed, details
 
 # ---------- Orchestrator / main loop ----------
+def detect_regime(df: pd.DataFrame, detector: RegimeDetector | None = None) -> Dict[str, Any] | None:
+    """
+    Latest regime snapshot for `df`, or None if the detector cannot produce one
+    (too little history, NaN features, ...).  A failed detection must never
+    abort the cycle: callers treat None as "unknown regime", which the router
+    maps to cash.
+    """
+    detector = detector or RegimeDetector()
+    try:
+        return detector.latest_regime(df)
+    except Exception as exc:
+        print(f"Regime detection failed ({exc!r}); treating regime as unknown")
+        return None
+
+
+def regime_history(df: pd.DataFrame, detector: RegimeDetector | None = None) -> pd.Series | None:
+    """
+    Per-bar regime labels for `df` (see RegimeDetector.regime_history), or None
+    if the detector cannot produce them.  None makes the cooldown treat the
+    regime as unknown, which blocks new entries -- the safe direction.
+    """
+    detector = detector or RegimeDetector()
+    try:
+        return detector.regime_history(df)
+    except Exception as exc:
+        print(f"Regime history unavailable ({exc!r}); treating regime as unstable")
+        return None
+
+
+class _UnattributedOwner(Strategy):
+    """
+    Stand-in owner for a position the trade log cannot attribute to any
+    strategy.  It always wants to be flat, so whatever path handles it ends
+    in a market sell logged under UNATTRIBUTED_STRATEGY rather than polluting
+    a real strategy's P&L history.
+    """
+
+    def __init__(self):
+        super().__init__(UNATTRIBUTED_STRATEGY)
+
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["signal"] = 0
+        return out
+
+
+def strategy_eligible_in_regime(strategy_name: str, regime: str | None,
+                                router: StrategyRouter | None = None) -> bool:
+    """
+    May `strategy_name` hold risk in `regime`?
+
+    Routed mode (router given): eligible iff the router lists it as a
+    candidate for the regime -- an unknown/cash regime has no candidates, so
+    nothing is eligible.  Pinned mode: the registry-derived REGIME_MAP gate;
+    strategies absent from it are unrestricted.
+    """
+    if router is not None:
+        return strategy_name in router.candidates_for(regime)
+    allowed = REGIME_MAP.get(strategy_name, {}).get('allowed', [])
+    return (not allowed) or (regime in allowed)
+
+
+class CyclePlan:
+    """
+    What one cycle should do, decided before any signal is generated.
+
+    flatten / flatten_reason:
+        If set, the open position must first be force-closed with a market
+        sell, logged under `flatten` (the owner, or the Unattributed stand-in).
+    strategy:
+        Strategy whose signal drives the rest of the cycle once flat (or the
+        owner, when it simply keeps managing its position).  None = nothing
+        further to do.
+    """
+
+    def __init__(self, strategy: Strategy | None, reason: str,
+                 flatten: Strategy | None = None, flatten_reason: str | None = None):
+        self.strategy = strategy
+        self.reason = reason
+        self.flatten = flatten
+        self.flatten_reason = flatten_reason
+
+    def __repr__(self) -> str:
+        s = self.strategy.name if self.strategy else None
+        f = self.flatten.name if self.flatten else None
+        return f"CyclePlan(strategy={s!r}, flatten={f!r}, flatten_reason={self.flatten_reason!r}, reason={self.reason!r})"
+
+
+def plan_cycle(
+    decision: RoutingDecision,
+    symbol: str,
+    in_position: bool,
+    router: StrategyRouter,
+    pinned: Strategy | None = None,
+    force_flatten: bool = True,
+    stability: RegimeStability | None = None,
+) -> CyclePlan:
+    """
+    Decide which strategy drives this cycle, and whether the open position
+    must be force-closed first.
+
+    Policy
+    ------
+    * Flat  -> the routed strategy (or the pinned one) may enter; nobody if
+               the router chose cash.
+    * Long, owner still eligible in the current regime -> the owner keeps
+      managing the position (its own signal decides the exit), even if the
+      router's first choice for the regime is a different strategy.  This
+      keeps the SELL paired with the right BUY and P&L attributed correctly.
+    * Long, owner NOT eligible (regime routed to cash, or a hard shift to a
+      regime the owner does not trade) -> force-flatten under the owner's
+      name, then hand the cycle to the newly routed strategy so fresh capital
+      is only allocated once the old regime's risk is off the book.
+    * Long, owner unknown -> force-flatten under UNATTRIBUTED_STRATEGY: a
+      position nobody claims cannot be managed consistently.
+
+    `force_flatten=False` restores the permissive behaviour: an ineligible or
+    unknown owner keeps/adopts the position and exits on signal only.
+
+    Regime cooldown (`stability`, see regimes.stability)
+    ----------------------------------------------------
+    When the current regime has not yet held for the required number of bars
+    the regime is *in cooldown*: everything above that protects capital still
+    happens immediately (an ineligible owner is flattened on the spot), but
+    **no new position is opened** -- neither by the routed strategy nor by a
+    strategy taking over after a flatten -- until the regime proves stable.
+    The cooldown governs regime-aware strategies only: a pinned strategy that
+    is absent from REGIME_MAP is unrestricted by regime and therefore also
+    unaffected by the cooldown.
+    """
+    regime = decision.regime
+    routed_next = None if pinned is not None else decision.strategy
+    cooldown = (
+        stability is not None and stability.in_cooldown
+        and (pinned is None or pinned.name in REGIME_MAP)
+    )
+    if cooldown:
+        routed_next = None
+        cooldown_note = f"regime cooldown [{stability}]: no new positions"
+
+    # ----- flat: who may enter --------------------------------------------
+    if not in_position:
+        if cooldown:
+            return CyclePlan(None, cooldown_note)
+        if pinned is not None:
+            return CyclePlan(pinned, "pinned")
+        if decision.is_cash:
+            return CyclePlan(None, f"router chose cash ({decision.reason})")
+        return CyclePlan(decision.strategy, f"routed ({decision.reason})")
+
+    # ----- long: establish the owner ----------------------------------------
+    if pinned is not None:
+        owner: Strategy | None = pinned
+        eligible = strategy_eligible_in_regime(pinned.name, regime)
+    else:
+        owner = None
+        owner_name = find_position_owner(symbol)
+        if owner_name is None:
+            print(f"No trade-log owner found for open position in {symbol}")
+        else:
+            try:
+                owner = router.get_strategy(owner_name)
+            except KeyError:
+                print(f"Position owner {owner_name!r} is not a registered strategy")
+        if owner is None:
+            if force_flatten:
+                why = cooldown_note if cooldown else f"after flattening unattributed position ({decision.reason})"
+                return CyclePlan(routed_next, why,
+                                 flatten=_UnattributedOwner(), flatten_reason=REASON_UNATTRIBUTED)
+            if decision.is_cash:
+                return CyclePlan(None, "open position without owner and router chose cash; holding")
+            return CyclePlan(decision.strategy, f"adopting unowned position ({decision.reason})")
+        eligible = strategy_eligible_in_regime(owner.name, regime, router)
+
+    # ----- long: keep or force out -------------------------------------------
+    if eligible:
+        return CyclePlan(owner, "owns the open position and is eligible in this regime")
+    if not force_flatten:
+        return CyclePlan(owner, f"owns the open position (not eligible in {regime!r}, but force_flatten=False)")
+
+    if decision.is_cash:
+        flatten_reason = f"{REASON_REGIME_CASH}:{regime}"
+    else:
+        flatten_reason = f"{REASON_REGIME_SHIFT}:{regime}"
+    # Pinned mode: the pinned strategy is what just got flattened, so it may
+    # not re-enter this cycle (the regime gate would refuse it anyway).
+    if cooldown:
+        next_reason = f"flattened {owner.name}; {cooldown_note}"
+    elif routed_next is not None:
+        next_reason = f"after flattening {owner.name} ({decision.reason})"
+    else:
+        next_reason = f"nothing to run after flattening {owner.name}"
+    return CyclePlan(routed_next, next_reason, flatten=owner, flatten_reason=flatten_reason)
+
+
+# ---------- forced flattening ----------
+class FlattenResult:
+    """Outcome of a forced flatten: was the position fully closed, and what
+    (if anything) was sold and is now awaiting settlement."""
+
+    def __init__(self, closed: bool, liquidation: PendingLiquidation | None):
+        self.closed = closed
+        self.liquidation = liquidation
+
+    def __bool__(self) -> bool:  # so `if flatten_position(...)` still reads naturally
+        return self.closed
+
+    def __repr__(self) -> str:
+        return f"FlattenResult(closed={self.closed}, liquidation={self.liquidation!r})"
+
+
+def flatten_position(owner: Strategy, symbol: str, broker, position: Dict[str, Any],
+                     ref_price: float, reason: str,
+                     ledger: SettlementLedger | None = None) -> FlattenResult:
+    """
+    Market-sell the whole open position in `symbol`, logging the SELL under
+    `owner` with the given reason.
+
+    `closed` is True only if the position is now fully flat; a rejected or
+    partial fill leaves it False so the caller does not put new capital to
+    work on top of residual risk.  Whatever *was* sold is returned as a
+    PendingLiquidation (and recorded in `ledger` if given) so the risk gates
+    keep treating it as unsettled.
+    """
+    qty = float(position.get('qty', 0) or 0)
+    print(f"FORCED FLATTEN ({reason}): closing {qty} {symbol} held by {owner.name}")
+    rec = _exit_position(owner, symbol, broker, position, ref_price, reason=reason)
+    if rec is None:
+        print("Forced flatten NOT executed; position remains open.")
+        return FlattenResult(False, None)
+
+    sold_qty, fill_price = float(rec['qty']), float(rec['price'])
+    # rec['fees'] also carries the prorated entry fee, so proceeds are slightly
+    # *under*-stated -- the conservative direction for spendable cash.
+    liq = PendingLiquidation(symbol, sold_qty, fill_price,
+                             proceeds=sold_qty * fill_price - float(rec.get('fees') or 0.0),
+                             pre_qty=qty, timestamp=rec['timestamp'], reason=reason)
+    if ledger is not None:
+        ledger.record(liq)
+
+    remaining = qty - sold_qty
+    if remaining > 1e-9:
+        print(f"Forced flatten only partially filled; {remaining} {symbol} still open.")
+        return FlattenResult(False, liq)
+    return FlattenResult(True, liq)
+
+
+def flatten_all_positions(broker, router: StrategyRouter | None = None,
+                          price_lookup: Dict[str, float] | None = None,
+                          reason: str = REASON_MANUAL,
+                          ledger: SettlementLedger | None = None) -> Dict[str, FlattenResult]:
+    """
+    Kill switch: market-sell every open position, each logged under the
+    strategy that opened it (or Unattributed).  Returns {symbol: FlattenResult};
+    every sale is recorded in `ledger` when one is given.
+    """
+    router = router or StrategyRouter()
+    results: Dict[str, FlattenResult] = {}
+    for symbol, position in list((broker.get_positions() or {}).items()):
+        if float(position.get('qty', 0) or 0) <= 0:
+            continue
+        owner: Strategy | None = None
+        owner_name = find_position_owner(symbol)
+        if owner_name is not None:
+            try:
+                owner = router.get_strategy(owner_name)
+            except KeyError:
+                pass
+        owner = owner or _UnattributedOwner()
+        ref_price = float((price_lookup or {}).get(symbol) or position.get('avg_price') or 0.0)
+        results[symbol] = flatten_position(owner, symbol, broker, position, ref_price, reason, ledger=ledger)
+    return results
+
+
 def orchestrate_one_cycle(
-    strategy: Strategy,
+    strategy: Strategy | None,
     symbol: str,
     broker: FyersPaperBroker,
     data_source: DataSource | None = None,
     lookback_days: int = 180,
+    router: StrategyRouter | None = None,
+    detector: RegimeDetector | None = None,
+    force_flatten: bool = True,
+    ledger: SettlementLedger | None = None,
+    min_stable_periods: int = DEFAULT_MIN_STABLE_PERIODS,
+    cooldown: RegimeCooldown | None = None,
 ):
-    print(f"[{datetime.now()}] Orchestrator: symbol={symbol}, strategy={strategy.name}")
+    """
+    Run one decision cycle for `symbol`.
+
+    strategy:
+        Pin a specific strategy for this cycle (it still has to pass the regime
+        gate below).  Pass ``None`` to let `router` pick one from the detected
+        regime -- the normal mode for live/paper trading.
+    router:
+        Regime -> strategy policy used when `strategy` is None.  Defaults to
+        ``StrategyRouter()`` (the registry's REGIME_STRATEGY_MAP, cash fallback).
+        Reuse one router across cycles so strategy instances are shared.
+    force_flatten:
+        Strict regime discipline (default).  If we hold `symbol` and the
+        strategy that opened it is no longer eligible in the current regime
+        (regime routed to cash, a hard shift to a regime it does not trade, or
+        the position cannot be attributed at all), the position is closed with
+        a market sell *before* the newly routed strategy may allocate capital.
+        See `plan_cycle` for the full policy.
+    ledger:
+        SettlementLedger of liquidations whose proceeds are not yet settled.
+        Any forced flatten in this cycle is recorded in it, and the sizing /
+        total-exposure gates treat everything in it as still deployed and
+        its cash as unspendable.  Defaults to a fresh ledger per cycle (i.e.
+        strict treatment of this cycle's own liquidation); pass one shared
+        ledger across a sweep of symbols so a flatten in one symbol's cycle
+        is respected by entries in the next symbol's cycle.
+    min_stable_periods:
+        Regime-transition cooldown (default 3 bars).  New capital is only
+        allocated once the detected regime has held for this many consecutive
+        bars; until then ineligible positions are still flattened immediately
+        but nothing new is opened, so a regime flickering on a threshold
+        cannot churn sell/re-buy fees every day.  1 disables the cooldown.
+        Labels in the same family (default: TREND + VOL_BREAKOUT) share one
+        streak, so a breakout bar after a trend is not a "new" regime.
+    cooldown:
+        A pre-built RegimeCooldown (e.g. with custom families); when given it
+        takes precedence over `min_stable_periods`.
+    """
+    mode = f"strategy={strategy.name} (pinned)" if strategy is not None else "strategy=<routed>"
+    print(f"[{datetime.now()}] Orchestrator: symbol={symbol}, {mode}")
     data_source = data_source or YFinanceDataSource()
     end_date = datetime.today()
     start_date = end_date - timedelta(days=lookback_days)
@@ -348,21 +811,53 @@ def orchestrate_one_cycle(
         print("No data, skipping")
         return
 
-    # 1) detect regime
-    detector = RegimeDetector()
-    regime_info = detector.latest_regime(df)
-    regime = regime_info['regime']
+    # 1) detect regime, check it has settled, and route it to a strategy
+    regime_info = detect_regime(df, detector)
+    regime = regime_info['regime'] if regime_info else None
     print("Regime:", regime)
 
-    # 2) generate signals
+    cooldown = cooldown or RegimeCooldown(min_stable_periods)
+    stability = cooldown.assess(regime_history(df, detector))
+    print("Regime stability:", stability)
+
+    router = router or StrategyRouter()
+    decision = router.route(regime_info)
+    print("Routing:", decision)
+
+    position = broker.get_positions().get(symbol)
+    in_position = bool(position) and float(position.get('qty', 0)) > 0
+    price = float(df['Close'].iloc[-1])
+
+    routed = strategy is None
+    plan = plan_cycle(decision, symbol, in_position, router,
+                      pinned=strategy, force_flatten=force_flatten, stability=stability)
+
+    # 2) regime discipline: the old regime's risk comes off *before* anything
+    # else happens.  If the sell does not fully fill, stop here -- allocating
+    # fresh capital on top of residual exposure is exactly what we must avoid.
+    ledger = ledger if ledger is not None else SettlementLedger()
+    if plan.flatten is not None:
+        result = flatten_position(plan.flatten, symbol, broker, position, price,
+                                  plan.flatten_reason, ledger=ledger)
+        if not result.closed:
+            print("Cycle halted: not allocating to a new strategy while the old position is still open.")
+            return
+        position, in_position = None, False
+        print(f"Liquidation of {result.liquidation.qty} {symbol} "
+              f"(~{result.liquidation.proceeds:.2f}) is treated as UNSETTLED for the rest of this cycle: "
+              f"it still counts toward exposure and its cash is not available for sizing.")
+
+    strategy = plan.strategy
+    if strategy is None:
+        print(f"No strategy for this cycle: {plan.reason}. Done.")
+        return
+    print(f"Using strategy {strategy.name}: {plan.reason}")
+
+    # 3) generate signals
     sig_df = strategy.generate_signals(df)
     latest = sig_df.iloc[-1]
     signal = int(latest.get('signal', 0))
     print("Latest signal:", signal)
-
-    price = float(latest['Close'])
-    position = broker.get_positions().get(symbol)
-    in_position = bool(position) and float(position.get('qty', 0)) > 0
 
     # ---------------- EXIT WORKFLOW ----------------
     # A flat signal while we hold the symbol closes the round trip and realises P&L.
@@ -380,7 +875,7 @@ def orchestrate_one_cycle(
         print("No trade signal and no open position. Done.")
         return
 
-    # 3) strategy health gate
+    # 4) strategy health gate
     metrics = recent_metrics_from_history(strategy.name)
     print("Recent metrics:", metrics)
     if (metrics.get('sharpe') is None) or (metrics['sharpe'] < SHARPE_MIN):
@@ -393,40 +888,50 @@ def orchestrate_one_cycle(
         print("Strategy drawdown too deep. Skipping.")
         return
 
-    # 4) regime gate
-    allowed = REGIME_MAP.get(strategy.name, {}).get('allowed', [])
-    if allowed and (regime not in allowed):
-        print(f"Regime gate failed: {regime} not in {allowed}")
-        return
+    # 5) regime gate (pinned strategies only -- in routed mode the router *is*
+    # the regime policy, and a custom map or explicit fallback must not be
+    # second-guessed by the registry-derived table here)
+    if not routed:
+        allowed = REGIME_MAP.get(strategy.name, {}).get('allowed', [])
+        if allowed and (regime not in allowed):
+            print(f"Regime gate failed: {regime} not in {allowed}")
+            return
 
-    # 5) risk sizing: MAX_EXPOSURE_PER_TRADE of *total portfolio value*
-    # (cash + open positions at market), capped so notional + fees fit in cash.
-    snapshot = compute_portfolio_exposure(broker, {symbol: price})
+    # 6) risk sizing: MAX_EXPOSURE_PER_TRADE of *total portfolio value*
+    # (cash + open positions at market), capped so notional + fees fit in
+    # *settled* cash -- proceeds of any unsettled liquidation are excluded.
+    snapshot = compute_portfolio_exposure(broker, {symbol: price}, pending=ledger)
+    if snapshot['unsettled_proceeds'] > 0 or snapshot['in_flight_value'] > 0:
+        print(f"Unsettled liquidations: {len(ledger)} sale(s), proceeds {snapshot['unsettled_proceeds']:.2f} "
+              f"withheld from cash ({snapshot['cash']:.2f} -> settled {snapshot['settled_cash']:.2f}), "
+              f"in-flight exposure {snapshot['in_flight_value']:.2f} still counted")
     fee_pct = estimated_fee_pct_for(broker)
     qty = compute_position_qty(snapshot['portfolio_value'], price,
                                exposure_frac=MAX_EXPOSURE_PER_TRADE,
-                               cash_available=snapshot['cash'], fee_pct=fee_pct)
+                               cash_available=snapshot['settled_cash'], fee_pct=fee_pct)
     if qty <= 0:
         print(f"Sizing produced 0 shares (portfolio {snapshot['portfolio_value']:.2f}, "
-              f"cash {snapshot['cash']:.2f}, price {price}). Skipping.")
+              f"settled cash {snapshot['settled_cash']:.2f}, price {price}). Skipping.")
         return
     print(f"Sized {qty} shares = {qty * price:.2f} "
           f"({qty * price / snapshot['portfolio_value']:.2%} of portfolio, target {MAX_EXPOSURE_PER_TRADE:.0%})")
 
-    # 6) portfolio exposure gate: per-trade sizing is not enough on its own --
-    # the sum of every open position plus this order must stay within
-    # MAX_TOTAL_EXPOSURE of portfolio value, otherwise the signal is skipped.
+    # 7) portfolio exposure gate: per-trade sizing is not enough on its own --
+    # the sum of every open position, plus unsettled liquidations still in
+    # flight, plus this order must stay within MAX_TOTAL_EXPOSURE of portfolio
+    # value, otherwise the signal is skipped.
     allowed, exp = check_total_exposure(broker, symbol, qty, price,
                                         max_total_exposure=MAX_TOTAL_EXPOSURE, snapshot=snapshot)
     print(f"Exposure: current {exp['exposure']:.1%} "
-          f"(positions {exp['positions_value']:.2f} / portfolio {exp['portfolio_value']:.2f}), "
+          f"(positions {exp['positions_value']:.2f} + in-flight {exp['in_flight_value']:.2f} "
+          f"/ portfolio {exp['portfolio_value']:.2f}), "
           f"projected with this trade {exp['projected_exposure']:.1%}, limit {exp['max_total_exposure']:.0%}")
     if not allowed:
         print(f"Total exposure gate failed: {exp['projected_exposure']:.1%} would exceed "
               f"{exp['max_total_exposure']:.0%}. Skipping trade.")
         return
 
-    # 7) place order
+    # 8) place order
     _enter_position(strategy, symbol, broker, qty, price)
 
 
@@ -452,6 +957,7 @@ def _enter_position(strategy: Strategy, symbol: str, broker: FyersPaperBroker, q
         'entry_price': fill_price,
         'fees': fee,
         'pnl': np.nan,  # open trade: realised on exit
+        'reason': REASON_SIGNAL,
     }
     append_trade_to_history(rec)
     print("Entry logged (paper).")
@@ -459,10 +965,12 @@ def _enter_position(strategy: Strategy, symbol: str, broker: FyersPaperBroker, q
 
 
 def _exit_position(strategy: Strategy, symbol: str, broker: FyersPaperBroker,
-                   position: Dict[str, Any], ref_price: float):
+                   position: Dict[str, Any], ref_price: float,
+                   reason: str = REASON_SIGNAL):
     """
     Close the full open position, compute realised P&L from entry vs exit price
     (net of entry + exit fees) and log it so it feeds the strategy's metrics.
+    `reason` is recorded in the trade log (signal exit vs forced flatten).
     """
     qty = float(position['qty'])
     # Entry cost basis: the broker's average fill price is authoritative.
@@ -507,9 +1015,10 @@ def _exit_position(strategy: Strategy, symbol: str, broker: FyersPaperBroker,
         'entry_price': entry_price,
         'fees': fees,
         'pnl': pnl,
+        'reason': reason,
     }
     append_trade_to_history(rec)
-    print(f"Exit logged (paper). Realised P&L: {pnl:.2f} (fees {fees:.2f})")
+    print(f"Exit logged (paper, reason={reason}). Realised P&L: {pnl:.2f} (fees {fees:.2f})")
     return rec
 
 # ---------- sample run ----------
@@ -519,6 +1028,10 @@ if __name__ == "__main__":
         market_price_provider=default_price_provider,
         fees_pct=0.05,
     )
-    strat_cls = get_strategy_class("Donchian_Breakout")
-    strat = strat_cls()
-    orchestrate_one_cycle(strat, "RELIANCE.NS", broker)
+    # Let the regime decide which strategy trades.  Build the router once and
+    # reuse it across symbols/cycles so strategy instances are shared.
+    router = StrategyRouter()
+    orchestrate_one_cycle(None, "RELIANCE.NS", broker, router=router)
+
+    # To pin a single strategy instead (e.g. while evaluating it in paper mode):
+    # orchestrate_one_cycle(get_strategy_class("Donchian_Breakout")(), "RELIANCE.NS", broker)
