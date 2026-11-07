@@ -1,10 +1,21 @@
 # regimes/detector.py
 from __future__ import annotations
+import math
 import pandas as pd
 from dataclasses import dataclass
 from typing import Dict, Any
 
 from utils.indicators import atr, adx, bollinger_bandwidth, rolling_vol
+
+
+def normalise_regime(value: Any) -> str | None:
+    """Canonical regime key ('trend ' -> 'TREND'); None for missing/NaN/empty."""
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    text = str(value).strip().upper()
+    return text or None
 
 
 @dataclass
@@ -105,6 +116,12 @@ class RegimeDetector:
         feats = self.compute_features(df)
         feats["Regime"] = feats.apply(self.classify_row, axis=1)
         return feats
+
+    def regime_history(self, df: pd.DataFrame) -> pd.Series:
+        """Per-bar regime labels for the whole frame (index preserved).  All the
+        underlying indicators are backward-looking, so the tail of this series
+        is what the detector would have reported on each of those days."""
+        return self.detect(df)["Regime"]
 
     def latest_regime(self, df: pd.DataFrame) -> Dict[str, Any]:
         feats = self.detect(df)

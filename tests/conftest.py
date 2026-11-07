@@ -39,3 +39,16 @@ def isolated_market_data_cache(tmp_path, monkeypatch):
     cache_dir = tmp_path / "market_data_cache"
     monkeypatch.setenv("MARKET_DATA_CACHE_DIR", str(cache_dir))
     return cache_dir
+
+@pytest.fixture(autouse=True)
+def paper_trade_log(tmp_path, monkeypatch):
+    """
+    Point orchestrator's CSV trade log at a per-test file so no test can ever
+    read or write the developer's real paper_trade_log.csv.  Autouse as a
+    safety net; request it explicitly when a test needs the path.
+    """
+    import orchestrator
+
+    path = tmp_path / "paper_trade_log.csv"
+    monkeypatch.setattr(orchestrator, "TRADE_LOG_CSV", str(path))
+    return path

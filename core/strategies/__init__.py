@@ -5,6 +5,7 @@ from .registry import (
     get_strategy_class,
     strategies_for_regime,
 )
+from .router import RoutingDecision, StrategyRouter
 
 __all__ = [
     "Strategy",
@@ -12,6 +13,6 @@ __all__ = [
     "REGIME_STRATEGY_MAP",
     "get_strategy_class",
     "strategies_for_regime",
+    "StrategyRouter",
+    "RoutingDecision",
 ]
-
-
